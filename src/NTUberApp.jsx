@@ -31,6 +31,7 @@ import {
 // --- 合約設定 ---
 const CONTRACT_ADDRESS = "0xa5a5d38a99dcd0863C62347337Bf90093A54eFeE";
 const SEPOLIA_CHAIN_ID = '0xaa36a7'; 
+const ETH_TO_NTD_RATE = 100000; // 匯率設定 (1 ETH = 100,000 NTD)
 
 const CONTRACT_ABI = [
   "function requestRide(string memory _pickup, string memory _dropoff) public payable",
@@ -66,6 +67,8 @@ const NTUberApp = () => {
   const [dropoffCoords, setDropoffCoords] = useState(null);
   const [activeField, setActiveField] = useState(null);
   const [estimatedPrice, setEstimatedPrice] = useState(0.001); 
+  const [driverCoords, setDriverCoords] = useState(null); // 新增：司機位置狀態
+  const [userLocation, setUserLocation] = useState(null); // 新增：使用者位置
   const [selectedRideType, setSelectedRideType] = useState('NTUber Bike');
   
   const [loading, setLoading] = useState(false);
@@ -93,6 +96,72 @@ const NTUberApp = () => {
     } catch (e) {
       return { name: locString, lat: 25.0174, lng: 121.5397 };
     }
+  };
+
+  // 匯率轉換 helper
+  const toNTD = (ethValue) => {
+    const val = parseFloat(ethValue);
+    return isNaN(val) ? '0' : Math.floor(val * ETH_TO_NTD_RATE).toLocaleString();
+  };
+
+  // --- 真實位置同步邏輯 (LocalStorage 用於跨分頁通訊) ---
+  useEffect(() => {
+    // 若無進行中行程，清除司機位置
+    if (!myCurrentRide || !['Accepted', 'Ongoing'].includes(myCurrentRide.status)) {
+      setDriverCoords(null);
+      return;
+    }
+
+    const rideId = myCurrentRide.id;
+    const storageKey = `ntuber_driver_location_${rideId}`;
+
+    if (role === 'driver') {
+      // --- 司機端：獲取 GPS 並廣播 ---
+      if (!navigator.geolocation) return;
+
+      const geoId = navigator.geolocation.watchPosition(
+        (position) => {
+          const coords = { 
+            lat: position.coords.latitude, 
+            lng: position.coords.longitude 
+          };
+          setDriverCoords(coords); // 更新本地顯示
+          localStorage.setItem(storageKey, JSON.stringify(coords)); // 廣播給乘客
+        },
+        (err) => console.error("位置獲取失敗:", err),
+        { enableHighAccuracy: true, maximumAge: 0 }
+      );
+
+      return () => navigator.geolocation.clearWatch(geoId);
+
+    } else {
+      // --- 乘客端：監聽位置更新 ---
+      const syncLocation = () => {
+        const stored = localStorage.getItem(storageKey);
+        if (stored) {
+          try {
+            setDriverCoords(JSON.parse(stored));
+          } catch (e) { console.error(e); }
+        }
+      };
+
+      syncLocation(); // 初始讀取
+      const intervalId = setInterval(syncLocation, 1000); // 輪詢
+      return () => clearInterval(intervalId);
+    }
+  }, [myCurrentRide, role]);
+
+  // --- 定位功能 ---
+  const handleLocateMe = () => {
+    if (!navigator.geolocation) return alert("您的瀏覽器不支援地理定位");
+    
+    navigator.geolocation.getCurrentPosition(
+      (position) => {
+        const { latitude, longitude } = position.coords;
+        setUserLocation({ lat: latitude, lng: longitude });
+      },
+      (error) => console.error("Error getting location:", error)
+    );
   };
 
   const statusMap = ['Created', 'Accepted', 'Ongoing', 'Completed', 'Cancelled'];
@@ -271,23 +340,42 @@ const NTUberApp = () => {
     }
   };
 
-  const handleAcceptRide = async (rideId) => {
+  const handleAcceptRide = (rideId) => {
     if (!contract) return;
-    try {
-      await switchNetwork();
-      setLoading(true);
-      setLoadingMsg('正在接單...');
-      
-      const currentSigner = await (new ethers.BrowserProvider(window.ethereum)).getSigner();
-      const contractWithSigner = contract.connect(currentSigner);
-      
-      const tx = await contractWithSigner.acceptRide(rideId);
-      await tx.wait();
-      setLoading(false);
-    } catch (err) {
-      console.error(err);
-      alert("接單失敗: " + (err.reason || err.message));
-      setLoading(false);
+
+    const executeAccept = async () => {
+      try {
+        await switchNetwork();
+        setLoading(true);
+        setLoadingMsg('正在接單...');
+        
+        const currentSigner = await (new ethers.BrowserProvider(window.ethereum)).getSigner();
+        const contractWithSigner = contract.connect(currentSigner);
+        
+        const tx = await contractWithSigner.acceptRide(rideId);
+        await tx.wait();
+        setLoading(false);
+      } catch (err) {
+        console.error(err);
+        alert("接單失敗: " + (err.reason || err.message));
+        setLoading(false);
+      }
+    };
+
+    if (navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        (position) => {
+          const { latitude, longitude } = position.coords;
+          setUserLocation({ lat: latitude, lng: longitude });
+          executeAccept();
+        },
+        (error) => {
+          console.error("Location error:", error);
+          alert("需允許位置存取才能接單 (供乘客追蹤)");
+        }
+      );
+    } else {
+      alert("瀏覽器不支援定位");
     }
   };
 
@@ -447,7 +535,7 @@ const NTUberApp = () => {
   };
 
   // --- 地圖元件 ---
-  const LeafletMap = ({ pickupCoords, dropoffCoords, currentRide, previewRide, onMapClick }) => {
+  const LeafletMap = ({ pickupCoords, dropoffCoords, currentRide, previewRide, onMapClick, driverCoords, userLocation }) => {
     const mapRef = useRef(null);
     const mapInstanceRef = useRef(null);
     const markersRef = useRef([]);
@@ -482,7 +570,7 @@ const NTUberApp = () => {
         iconAnchor: [6, 6]
       });
 
-      const targetRide = currentRide || previewRide;
+      const targetRide = currentRide || previewRide; // 優先顯示當前行程
       
       const pCoords = targetRide?.pickupCoords || pickupCoords;
       const dCoords = targetRide?.dropoffCoords || dropoffCoords;
@@ -502,15 +590,27 @@ const NTUberApp = () => {
         map.panTo([pCoords.lat, pCoords.lng]);
       }
 
-      if (currentRide && ['Accepted', 'Ongoing'].includes(currentRide.status) && pCoords) {
+      if (driverCoords) {
         const carIcon = L.divIcon({
           className: 'car-icon',
           html: `<div style="background: black; color: white; padding: 4px; border-radius: 4px; font-size: 10px; display: flex; align-items: center; justify-content: center;">BIKE</div>`,
           iconSize: [30, 20]
         });
-        L.marker([pCoords.lat, pCoords.lng], { icon: carIcon, zIndexOffset: 1000 }).addTo(map);
+        L.marker([driverCoords.lat, driverCoords.lng], { icon: carIcon, zIndexOffset: 1000 }).addTo(map);
       }
-    }, [pickupCoords, dropoffCoords, currentRide, previewRide]);
+
+      if (userLocation) {
+        const userIcon = L.divIcon({
+          className: 'user-dot',
+          html: `<div style="background-color: #3b82f6; width: 12px; height: 12px; border-radius: 50%; border: 2px solid white; box-shadow: 0 0 4px rgba(0,0,0,0.5);"></div>`,
+          iconSize: [12, 12],
+          iconAnchor: [6, 6]
+        });
+        L.marker([userLocation.lat, userLocation.lng], { icon: userIcon, zIndexOffset: 500 }).addTo(map).bindPopup("您的位置");
+        
+        if (!currentRide && !previewRide && !pickupCoords) map.panTo([userLocation.lat, userLocation.lng]);
+      }
+    }, [pickupCoords, dropoffCoords, currentRide, previewRide, driverCoords, userLocation]);
     return <div ref={mapRef} className="absolute inset-0 z-0" />;
   };
 
@@ -565,7 +665,7 @@ const NTUberApp = () => {
         <div className="flex justify-between items-center text-xs">
           <div className="flex items-center space-x-1 bg-green-50 text-green-700 px-2 py-1 rounded">
             <Wallet size={12} />
-            <span className="font-mono">{balance} ETH</span>
+            <span className="font-mono">{balance} ETH <span className="text-gray-500 opacity-75">(≈NT${toNTD(balance)})</span></span>
           </div>
           <div className="text-gray-400">
             {walletAddress ? `${walletAddress.substring(0, 6)}...` : '未連接'}
@@ -611,7 +711,7 @@ const NTUberApp = () => {
                       'bg-blue-100 text-blue-700'
                     }`}>{ride.status}</span>
                   </div>
-                  <span className="font-mono text-xs">{ride.amount} ETH</span>
+                <span className="font-mono text-xs text-right">{ride.amount} ETH<br/><span className="text-gray-400">≈ NT${toNTD(ride.amount)}</span></span>
                 </div>
                 <div className="space-y-1 text-xs text-gray-600 mb-3">
                   <div className="flex items-center"><MapPin size={10} className="mr-1"/> {ride.pickup}</div>
@@ -676,7 +776,10 @@ const NTUberApp = () => {
                   <div className="bg-gray-200 p-2 rounded-full"><Bike size={24} className="text-gray-700" /></div>
                   <div><div className="font-bold text-lg">NTUber Bike</div><div className="text-xs text-gray-500">環保出行</div></div>
                 </div>
-                <div className="font-bold text-lg">{estimatedPrice} ETH</div>
+                <div className="text-right">
+                  <div className="font-bold text-lg">{estimatedPrice} ETH</div>
+                  <div className="text-sm text-gray-500">≈ NT${toNTD(estimatedPrice)}</div>
+                </div>
               </div>
             </div>
           )}
@@ -725,7 +828,10 @@ const NTUberApp = () => {
               >
                 <div className="flex justify-between items-start mb-2">
                   <div className="flex items-center space-x-2"><div className="bg-gray-100 p-1 rounded-full"><User size={12}/></div><span className="font-bold text-gray-600">#{ride.id}</span></div>
-                  <span className="font-bold text-green-600">{ride.amount} ETH</span>
+                  <div className="text-right">
+                    <div className="font-bold text-green-600">{ride.amount} ETH</div>
+                    <div className="text-xs text-gray-400">≈ NT${toNTD(ride.amount)}</div>
+                  </div>
                 </div>
                 <div className="space-y-2 text-xs text-gray-700 mb-3">
                   <div className="flex items-start space-x-2"><div className="w-1.5 h-1.5 bg-black rounded-full mt-1 flex-shrink-0"></div><span className="break-words">{ride.pickup}</span></div>
@@ -796,9 +902,9 @@ const NTUberApp = () => {
   );
 
   return (
-    <div className="font-sans text-gray-900 bg-gray-100 h-screen w-full flex flex-row overflow-hidden">
+    <div className="font-sans text-gray-900 bg-gray-100 h-screen w-full flex flex-col md:flex-row overflow-hidden">
       {/* 左側 UI 面板 (固定寬度 400px 或 35%) */}
-      <div className="w-full md:w-[400px] lg:w-[35%] min-w-[320px] max-w-[450px] flex-shrink-0 bg-white shadow-xl z-20 flex flex-col relative h-full">
+      <div className="w-full md:w-[400px] lg:w-[35%] md:min-w-[320px] md:max-w-[450px] flex-shrink-0 bg-white shadow-xl z-20 flex flex-col relative h-[60%] md:h-full order-2 md:order-1 rounded-t-2xl md:rounded-none">
         <Header />
         <div className="flex-grow overflow-hidden relative flex flex-col">
             {role === 'passenger' ? renderPassengerView() : renderDriverView()}
@@ -806,14 +912,23 @@ const NTUberApp = () => {
       </div>
 
       {/* 右側地圖 (填滿剩餘空間) */}
-      <div className="flex-grow relative z-0 h-full">
+      <div className="flex-grow relative z-0 h-[40%] md:h-full order-1 md:order-2">
         <LeafletMap 
           pickupCoords={pickupCoords} 
           dropoffCoords={dropoffCoords} 
           currentRide={myCurrentRide} 
           previewRide={previewRide} 
           onMapClick={handleMapClick} 
+          driverCoords={driverCoords}
+          userLocation={userLocation}
         />
+        <button 
+          onClick={handleLocateMe}
+          className="absolute bottom-6 right-6 bg-white p-3 rounded-full shadow-lg z-10 hover:bg-gray-100 text-gray-700 transition-colors"
+          title="定位我的位置"
+        >
+          <Crosshair size={24} />
+        </button>
       </div>
 
       {loading && <LoadingOverlay />}
