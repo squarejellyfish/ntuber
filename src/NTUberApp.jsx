@@ -104,6 +104,36 @@ const NTUberApp = () => {
     return isNaN(val) ? '0' : Math.floor(val * ETH_TO_NTD_RATE).toLocaleString();
   };
 
+  // 距離計算 helper (Haversine formula)
+  const getDistanceMeters = (lat1, lng1, lat2, lng2) => {
+    const R = 6371e3; // meters
+    const φ1 = lat1 * Math.PI/180;
+    const φ2 = lat2 * Math.PI/180;
+    const Δφ = (lat2-lat1) * Math.PI/180;
+    const Δλ = (lng2-lng1) * Math.PI/180;
+
+    const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) +
+              Math.cos(φ1) * Math.cos(φ2) *
+              Math.sin(Δλ/2) * Math.sin(Δλ/2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+
+    return R * c;
+  };
+
+  // 自動計算價格
+  useEffect(() => {
+    if (pickupCoords && dropoffCoords) {
+      const dist = getDistanceMeters(pickupCoords.lat, pickupCoords.lng, dropoffCoords.lat, dropoffCoords.lng);
+      let priceNTD = 0;
+      if (dist <= 500) priceNTD = 20;
+      else if (dist <= 1000) priceNTD = 30;
+      else priceNTD = 40 + Math.ceil((dist - 1000) / 100) * 5;
+
+      // 轉換為 ETH (保留5位小數)
+      setEstimatedPrice((priceNTD / ETH_TO_NTD_RATE).toFixed(5));
+    }
+  }, [pickupCoords, dropoffCoords]);
+
   // --- 真實位置同步邏輯 (LocalStorage 用於跨分頁通訊) ---
   useEffect(() => {
     // 若無進行中行程，清除司機位置
@@ -771,7 +801,7 @@ const NTUberApp = () => {
           </div>
           {pickup && dropoff && (
             <div className="space-y-3 mb-6">
-              <div onClick={() => { setSelectedRideType('NTUber Bike'); setEstimatedPrice(0.001); }} className={`flex justify-between items-center p-3 rounded-xl border-2 cursor-pointer transition ${selectedRideType === 'NTUber Bike' ? 'border-black bg-gray-50' : 'border-transparent hover:bg-gray-50'}`}>
+              <div onClick={() => { setSelectedRideType('NTUber Bike'); }} className={`flex justify-between items-center p-3 rounded-xl border-2 cursor-pointer transition ${selectedRideType === 'NTUber Bike' ? 'border-black bg-gray-50' : 'border-transparent hover:bg-gray-50'}`}>
                 <div className="flex items-center space-x-3">
                   <div className="bg-gray-200 p-2 rounded-full"><Bike size={24} className="text-gray-700" /></div>
                   <div><div className="font-bold text-lg">NTUber Bike</div><div className="text-xs text-gray-500">環保出行</div></div>
