@@ -8,4 +8,12 @@ export default defineConfig({
       react(),
       tailwindcss(),
   ],
+  server: {
+    host: true,
+    port: 5173,
+    allowedHosts: [
+      "untearable-nonlegitimate-marla.ngrok-free.dev",
+      "89e0f42f287cd7.lhr.life"
+    ]
+  }
 })
